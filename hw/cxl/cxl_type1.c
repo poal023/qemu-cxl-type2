@@ -70,9 +70,16 @@ typedef struct CXLType1StateImpl {
         bool enabled;
     } virtio_accel;
     
-    uint64_t device_size;
     uint64_t cache_size;
     uint64_t sn;
+
+    /* Accepted for command-line compatibility, otherwise unused. See 'size' */
+    uint64_t device_size;
+
+    /* Offset of the CXL Device DVSEC, needed to emulate its Control2 writes */
+    uint16_t device_dvsec_offset;
+    /* Cache size/unit encoded per CXL r3.2 8.1.3.7 */
+    uint16_t cache_cap2;
     
     struct {
         char *host;
@@ -105,43 +112,84 @@ enum CXLMemSimMsgType {
 };
 
 
+/*
+ * CXL r3.2 Section 8.1.3.7: DVSEC CXL Capability2 reports the cache size as an
+ * 8-bit multiple of a unit that is either 64KiB or 1MiB. Choose the unit that
+ * can represent @size, preferring the coarser one so that larger caches fit.
+ */
+static bool cxl_type1_encode_cache_size(uint64_t size, uint16_t *cap2,
+                                        Error **errp)
+{
+    unsigned unit_enc;
+    uint64_t unit, mult;
+
+    if (size == 0 || size % (64 * KiB)) {
+        error_setg(errp, "cache-size must be a non-zero multiple of 64KiB");
+        return false;
+    }
+
+    if (size % MiB == 0 && size / MiB <= 255) {
+        unit = MiB;
+        unit_enc = CXL_DVSEC_CACHE_UNIT_1M;
+    } else if (size / (64 * KiB) <= 255) {
+        unit = 64 * KiB;
+        unit_enc = CXL_DVSEC_CACHE_UNIT_64K;
+    } else {
+        error_setg(errp, "cache-size must be at most 255MiB, and at most "
+                   "16320KiB when not a whole number of MiB");
+        return false;
+    }
+
+    mult = size / unit;
+    *cap2 = ((mult << CXL_DVSEC_CACHE_SIZE_SHIFT) & CXL_DVSEC_CACHE_SIZE_MASK) |
+            ((unit_enc << CXL_DVSEC_CACHE_UNIT_SHIFT) &
+             CXL_DVSEC_CACHE_UNIT_MASK);
+    return true;
+}
+
 static void build_dvsecs(CXLType1StateImpl *ct1d)
 {
     CXLComponentState *cxl_cstate = &ct1d->cxl_cstate;
     uint8_t *dvsec;
-    
+
+    ct1d->device_dvsec_offset = cxl_cstate->dvsec_offset;
+
+    /*
+     * A Type 1 device speaks CXL.io and CXL.cache only. It exposes no
+     * host-managed device memory, so Mem_Capable is clear, the HDM count is
+     * zero and neither DVSEC range is valid.
+     */
     dvsec = (uint8_t *)&(CXLDVSECDevice){
-        .cap = 0x1f,  /* Bit 0: Cache+, Bit 1: IO+, Bit 2: Mem+, Bit 3: Mem HWInit+, Bit 4: HDMCount=1 */
-        .ctrl = 0x7,  /* Cache+ IO+ Mem+ enabled */
+        .cap = CXL_DVSEC_CACHE_CAPABLE | CXL_DVSEC_IO_CAPABLE |
+               CXL_DVSEC_WBINVD_CAPABLE,
+        .ctrl = CXL_DVSEC_CACHE_ENABLE | CXL_DVSEC_IO_ENABLE,
         .status = 0,
         .ctrl2 = 0,
-        .status2 = 0x2,
+        /*
+         * Cache Invalid only reports meaningfully once caching is disabled;
+         * with caching enabled it must read as 0.
+         */
+        .status2 = 0,
         .lock = 0,
-        .cap2 = (ct1d->cache_size >> 20) & 0xFFFF,  /* Cache size in MB for cap2 field */
-        .range1_size_hi = ct1d->cache_size >> 32,
-        .range1_size_lo = (ct1d->cache_size & 0xFFFFFFF0) | 0x3,  /* Valid, Active, Type=Cache */
-        .range1_base_hi = 0,
-        .range1_base_lo = 0,
-        .range2_size_hi = ct1d->device_size >> 32,
-        .range2_size_lo = (ct1d->device_size & 0xFFFFFFF0) | 0x1,  /* Valid, Type=Volatile */
-        .range2_base_hi = 0,
-        .range2_base_lo = 0,
+        .cap2 = ct1d->cache_cap2,
     };
-    
+
     cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
                               PCIE_CXL_DEVICE_DVSEC_LENGTH,
                               PCIE_CXL_DEVICE_DVSEC,
                               PCIE_CXL31_DEVICE_DVSEC_REVID,
                               dvsec);
-    
+
+    /*
+     * Only the component registers are advertised. A Type 1 device has no
+     * mailbox, and BAR2 holds the cache rather than CXL device registers.
+     */
     dvsec = (uint8_t *)&(CXLDVSECRegisterLocator){
         .rsvd = 0,
         .reg0_base_lo = RBI_COMPONENT_REG | CXL_COMPONENT_REG_BAR_IDX,
         .reg0_base_hi = 0,
-        .reg1_base_lo = RBI_CXL_DEVICE_REG | CXL_DEVICE_REG_BAR_IDX,
-        .reg1_base_hi = 0,
     };
-    
+
     cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
                               REG_LOC_DVSEC_LENGTH, REG_LOC_DVSEC,
                               REG_LOC_DVSEC_REVID, dvsec);
@@ -335,9 +383,12 @@ static void cxl_type1_realize(PCIDevice *pci_dev, Error **errp)
 {
     CXLType1StateImpl *ct1d = CXL_TYPE1_DEV(pci_dev);
     CXLComponentState *cxl_cstate = &ct1d->cxl_cstate;
-    
-    pci_config_set_prog_interface(pci_dev->config, 0x10);
-    
+
+    if (ct1d->device_size) {
+        warn_report("cxl-type1: 'size' is deprecated and ignored; a Type 1 "
+                    "device exposes no host-managed device memory");
+    }
+
     /* Set default values */
     if (!ct1d->cxlmemsim.server_addr) {
         ct1d->cxlmemsim.server_addr = g_strdup("127.0.0.1");
@@ -345,13 +396,15 @@ static void cxl_type1_realize(PCIDevice *pci_dev, Error **errp)
     if (ct1d->cxlmemsim.server_port == 0) {
         ct1d->cxlmemsim.server_port = 9999;
     }
-    if (ct1d->device_size == 0) {
-        ct1d->device_size = 256 * MiB;
-    }
     if (ct1d->cache_size == 0) {
         ct1d->cache_size = 64 * MiB;
     }
-    
+
+    if (!cxl_type1_encode_cache_size(ct1d->cache_size, &ct1d->cache_cap2,
+                                     errp)) {
+        return;
+    }
+
     qemu_mutex_init(&ct1d->cxlmemsim.lock);
     
     pcie_endpoint_cap_init(pci_dev, 0x80);
@@ -421,6 +474,42 @@ static void cxl_type1_realize(PCIDevice *pci_dev, Error **errp)
              ct1d->cache_size / MiB);
 }
 
+/*
+ * Emulate the cache management side effects of a DVSEC CXL Control2 write:
+ * Initiate CXL.cache Write Back and Invalidate is self-clearing and completes
+ * immediately here, leaving the cache empty. Re-enabling caching drops the
+ * Cache Invalid indication again.
+ */
+static void cxl_type1_config_write(PCIDevice *pci_dev, uint32_t addr,
+                                   uint32_t val, int len)
+{
+    CXLType1StateImpl *ct1d = CXL_TYPE1_DEV(pci_dev);
+    uint16_t ctrl2_off, stat2_off, ctrl2, stat2;
+
+    pci_default_write_config(pci_dev, addr, val, len);
+    msix_write_config(pci_dev, addr, val, len);
+
+    ctrl2_off = ct1d->device_dvsec_offset + offsetof(CXLDVSECDevice, ctrl2);
+    stat2_off = ct1d->device_dvsec_offset + offsetof(CXLDVSECDevice, status2);
+
+    if (!ranges_overlap(addr, len, ctrl2_off, sizeof(uint16_t))) {
+        return;
+    }
+
+    ctrl2 = pci_get_word(pci_dev->config + ctrl2_off);
+    stat2 = pci_get_word(pci_dev->config + stat2_off);
+
+    if (ctrl2 & CXL_DVSEC_INIT_WBINVD) {
+        ctrl2 &= ~CXL_DVSEC_INIT_WBINVD;
+        stat2 |= CXL_DVSEC_CACHE_INVALID;
+    } else if (!(ctrl2 & CXL_DVSEC_DISABLE_CACHING)) {
+        stat2 &= ~CXL_DVSEC_CACHE_INVALID;
+    }
+
+    pci_set_word(pci_dev->config + ctrl2_off, ctrl2);
+    pci_set_word(pci_dev->config + stat2_off, stat2);
+}
+
 static void cxl_type1_exit(PCIDevice *pci_dev)
 {
     CXLType1StateImpl *ct1d = CXL_TYPE1_DEV(pci_dev);
@@ -433,7 +522,12 @@ static void cxl_type1_exit(PCIDevice *pci_dev)
 }
 
 static const Property cxl_type1_props[] = {
-    DEFINE_PROP_SIZE("size", CXLType1StateImpl, device_size, 256 * MiB),
+    /*
+     * Deprecated and ignored. A Type 1 device has no host-managed device
+     * memory; this once emitted a bogus device-memory range in the CXL
+     * Device DVSEC. Retained so existing command lines keep working.
+     */
+    DEFINE_PROP_SIZE("size", CXLType1StateImpl, device_size, 0),
     DEFINE_PROP_SIZE("cache-size", CXLType1StateImpl, cache_size, 64 * MiB),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType1StateImpl, cxlmemsim.server_addr),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType1StateImpl, cxlmemsim.server_port, 9999),
@@ -446,10 +540,16 @@ static void cxl_type1_class_init(ObjectClass *oc, const void *data)
     
     pc->realize = cxl_type1_realize;
     pc->exit = cxl_type1_exit;
+    pc->config_write = cxl_type1_config_write;
     pc->vendor_id = CXL_T1_VENDOR_ID;
     pc->device_id = CXL_T1_DEVICE_ID;
     pc->revision = 1;
-    pc->class_id = PCI_CLASS_MEMORY_CXL;
+    /*
+     * A Type 1 device is an accelerator, not a CXL memory device. Using the
+     * CXL memory class (0502h/progif 10h) would make the kernel's cxl_pci
+     * driver match on class and race cxl_type1_accel for the device.
+     */
+    pc->class_id = PCI_CLASS_PROCESSING_ACCEL;
     
     dc->desc = "CXL Type 1 Accelerator Device";
     device_class_set_legacy_reset(dc, cxl_type1_reset);

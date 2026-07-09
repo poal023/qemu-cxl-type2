@@ -316,6 +316,18 @@ static void ras_init_common(uint32_t *reg_state, uint32_t *write_msk)
     stl_le_p(reg_state + R_CXL_RAS_ERR_CAP_CTRL, 0x200);
 }
 
+/*
+ * CXL r3.1 Section 8.2.4.23: both registers are read-only. Group ID 0 places
+ * every root port in a single snoop filter domain, which matches the single
+ * host bridge QEMU models.
+ */
+static void snoop_init_common(uint32_t *reg_state)
+{
+    stl_le_p(reg_state + R_CXL_SNOOP_GROUP_ID, 0);
+    stl_le_p(reg_state + R_CXL_SNOOP_FILTER_SIZE,
+             CXL_SNOOP_FILTER_DEFAULT_CAPACITY);
+}
+
 static void hdm_init_common(uint32_t *reg_state, uint32_t *write_msk,
                             enum reg_type type, bool bi)
 {
@@ -482,6 +494,7 @@ void cxl_component_register_init_common(uint32_t *reg_state,
 
     init_cap_reg(EXTSEC, 6, CXL_EXTSEC_CAP_VERSION);
     init_cap_reg(SNOOP, 8, CXL_SNOOP_CAP_VERSION);
+    snoop_init_common(reg_state);
 
 bi_caps:
     if (bi) {

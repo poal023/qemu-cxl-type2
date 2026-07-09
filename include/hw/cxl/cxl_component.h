@@ -201,6 +201,18 @@ HDM_DECODER_INIT(3);
 #define CXL_SNOOP_REGISTERS_OFFSET \
     (CXL_IDE_REGISTERS_OFFSET + CXL_IDE_REGISTERS_SIZE)
 #define CXL_SNOOP_REGISTERS_SIZE   0x8
+
+REG32(CXL_SNOOP_GROUP_ID, CXL_SNOOP_REGISTERS_OFFSET)
+    FIELD(CXL_SNOOP_GROUP_ID, GROUP_ID, 0, 16)
+REG32(CXL_SNOOP_FILTER_SIZE, CXL_SNOOP_REGISTERS_OFFSET + 0x4)
+
+/*
+ * Capacity, in bytes, of host memory that CXL.cache devices below a root port
+ * may collectively cache. Purely a bookkeeping value for the guest; nothing in
+ * QEMU enforces it.
+ */
+#define CXL_SNOOP_FILTER_DEFAULT_CAPACITY (256 * 1024 * 1024)
+
 #define CXL_BI_RT_CAP_VERSION 1
 #define CXL_BI_RT_REGISTERS_OFFSET \
     (CXL_SNOOP_REGISTERS_OFFSET + CXL_SNOOP_REGISTERS_SIZE)
