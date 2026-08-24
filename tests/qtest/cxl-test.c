@@ -2676,6 +2676,33 @@ static void cxl_t3d_persistent(void)
     rmdir(tmpfs);
 }
 
+/*
+ * Regression for KVM-direct CXL system RAM.  The production change that this
+ * catches is accidentally leaving the CFMWS as callback-backed MMIO instead
+ * of installing the Type-3 pmem backend as a RAM alias.
+ */
+static void cxl_t3d_persistent_kvm_direct(void)
+{
+    g_autoptr(GString) cmdline = g_string_new(NULL);
+    g_autofree const char *tmpfs = NULL;
+    g_autofree char *mtree = NULL;
+
+    tmpfs = g_dir_make_tmp("cxl-test-XXXXXX", NULL);
+    g_assert_nonnull(tmpfs);
+
+    g_string_printf(cmdline, QEMU_PXB_CMD QEMU_RP QEMU_T3D_PMEM,
+                    tmpfs, tmpfs);
+    g_string_prepend(cmdline, "-L ../pc-bios ");
+
+    g_setenv("CXL_EXECUTION_MODE", "kvm-direct", true);
+    qtest_start(cmdline->str);
+    mtree = qtest_hmp(global_qtest, "info mtree");
+    g_assert_nonnull(strstr(mtree, "cxl-kvm-direct-pmem"));
+    qtest_end();
+    g_unsetenv("CXL_EXECUTION_MODE");
+    rmdir(tmpfs);
+}
+
 static void cxl_t3d_volatile(void)
 {
     g_autoptr(GString) cmdline = g_string_new(NULL);
@@ -2807,6 +2834,8 @@ int main(int argc, char **argv)
                        cxl_t2_jext_cfmws_post_commit_drop);
         qtest_add_func("/pci/cxl/type3_device", cxl_t3d_deprecated);
         qtest_add_func("/pci/cxl/type3_device_pmem", cxl_t3d_persistent);
+        qtest_add_func("/pci/cxl/type3_device_pmem_kvm_direct",
+                       cxl_t3d_persistent_kvm_direct);
         qtest_add_func("/pci/cxl/type3_device_vmem", cxl_t3d_volatile);
         qtest_add_func("/pci/cxl/type3_device_vmem_lsa", cxl_t3d_volatile_lsa);
         qtest_add_func("/pci/cxl/rp_x2_type3_x2", cxl_1pxb_2rp_2t3d);

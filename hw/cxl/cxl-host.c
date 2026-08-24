@@ -11,6 +11,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "system/qtest.h"
+#include "system/kvm.h"
 #include "hw/boards.h"
 
 #include "qapi/qapi-visit-machine.h"
@@ -117,10 +118,106 @@ static int cxl_fmws_link(Object *obj, void *opaque)
     return 0;
 }
 
+typedef struct CXLDirectType3Search {
+    CXLType3Dev *device;
+    unsigned int count;
+} CXLDirectType3Search;
+
+static int cxl_fmws_find_direct_type3(Object *obj, void *opaque)
+{
+    CXLDirectType3Search *search = opaque;
+
+    if (object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        search->device = CXL_TYPE3(obj);
+        search->count++;
+    }
+
+    return 0;
+}
+
+static int cxl_fmws_setup_direct(Object *obj, void *opaque)
+{
+    Error **errp = opaque;
+    CXLDirectType3Search search = { 0 };
+    CXLFixedWindow *fw;
+    CXLType3Dev *ct3d;
+    MemoryRegion *pmr;
+    uint64_t pmr_size;
+    uint64_t page_size;
+
+    if (!object_dynamic_cast(obj, TYPE_CXL_FMW)) {
+        return 0;
+    }
+
+    fw = CXL_FMW(obj);
+    if (!fw->direct || fw->direct_alias_initialized) {
+        return 0;
+    }
+
+    if (fw->num_targets != 1) {
+        error_setg(errp, "KVM-direct CXL requires exactly one CFMWS target");
+        return 1;
+    }
+
+    object_child_foreach_recursive(object_get_root(),
+                                   cxl_fmws_find_direct_type3, &search);
+    if (search.count != 1) {
+        error_setg(errp,
+                   "KVM-direct CXL requires exactly one Type-3 endpoint; found %u",
+                   search.count);
+        return 1;
+    }
+
+    ct3d = search.device;
+    if (!ct3d->hostpmem || ct3d->hostvmem || ct3d->dc.num_regions) {
+        error_setg(errp,
+                   "KVM-direct CXL requires one persistent memory backend and "
+                   "does not support volatile or dynamic capacity memory");
+        return 1;
+    }
+
+    pmr = host_memory_backend_get_memory(ct3d->hostpmem);
+    if (!pmr || !memory_region_is_ram(pmr)) {
+        error_setg(errp, "KVM-direct CXL persistent backend is not RAM-backed");
+        return 1;
+    }
+
+    pmr_size = memory_region_size(pmr);
+    page_size = qemu_real_host_page_size();
+    if (!QEMU_IS_ALIGNED(fw->base, page_size) ||
+        !QEMU_IS_ALIGNED(pmr_size, page_size)) {
+        error_setg(errp,
+                   "KVM-direct CXL base 0x%" HWADDR_PRIx
+                   " and backend size 0x%" PRIx64
+                   " must be aligned to host page size 0x%" PRIx64,
+                   fw->base, pmr_size, page_size);
+        return 1;
+    }
+    if (pmr_size > fw->size) {
+        error_setg(errp,
+                   "KVM-direct CXL backend size 0x%" PRIx64
+                   " exceeds CFMWS size 0x%" PRIx64,
+                   pmr_size, fw->size);
+        return 1;
+    }
+
+    memory_region_init_alias(&fw->direct_alias, OBJECT(fw),
+                             "cxl-kvm-direct-pmem", pmr, 0, pmr_size);
+    memory_region_add_subregion(&fw->mr, 0, &fw->direct_alias);
+    fw->direct_alias_initialized = true;
+    info_report("CXL KVM-direct: mapped %" PRIu64
+                " MiB Type-3 pmem at HPA 0x%" HWADDR_PRIx,
+                pmr_size / MiB, fw->base);
+
+    return 0;
+}
+
 void cxl_fmws_link_targets(Error **errp)
 {
     /* Order doesn't matter for this, so no need to build list */
     object_child_foreach_recursive(object_get_root(), cxl_fmws_link, NULL);
+    object_child_foreach_recursive(object_get_root(), cxl_fmws_setup_direct,
+                                   errp);
 }
 
 static bool cxl_hdm_find_target(uint32_t *cache_mem, hwaddr addr,
@@ -528,9 +625,23 @@ hwaddr cxl_fmws_set_memmap(hwaddr base, hwaddr max_addr)
 static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 {
     CXLFixedWindow *fw = CXL_FMW(dev);
+    const char *execution_mode = getenv("CXL_EXECUTION_MODE");
 
-    memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
-                          "cxl-fixed-memory-region", fw->size);
+    fw->direct = execution_mode && !strcmp(execution_mode, "kvm-direct");
+    if (fw->direct) {
+        /*
+         * Don't gate on kvm_enabled() here: realize() runs before the
+         * accelerator is active, so it reads false even under --enable-kvm.
+         * The RAM alias and its validation happen later in
+         * cxl_fmws_setup_direct() (machine-init-done); direct mapping is
+         * correct under both KVM and TCG.
+         */
+        memory_region_init(&fw->mr, OBJECT(dev), "cxl-fixed-memory-region",
+                           fw->size);
+    } else {
+        memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
+                              "cxl-fixed-memory-region", fw->size);
+    }
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &fw->mr);
 }
 

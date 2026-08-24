@@ -32,11 +32,13 @@
 #include "system/numa.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_memsim_wait.h"
 #include "hw/pci/msix.h"
+#include "util/cxl-zero-coalesce.h"
 
 /* type3 device private */
 enum CXL_T3_MSIX_VECTOR {
@@ -1233,12 +1235,14 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 #define CXL_OP_FENCE        5   /* Memory fence */
 #define CXL_OP_LSA_READ     6   /* Label Storage Area read */
 #define CXL_OP_LSA_WRITE    7   /* Label Storage Area write */
+#define CXL_OP_ZERO_RANGE   14  /* Bulk provisioning zero */
 #define CXL_OP_DCD_ADD      8   /* Dynamic capacity add */
 #define CXL_OP_DCD_RELEASE  9   /* Dynamic capacity release */
 #define CXL_OP_DCD_QUERY    10  /* Dynamic capacity statistics */
 #define CXL_OP_GFAM_MAP     11  /* Grant GFAM host access */
 #define CXL_OP_GFAM_UNMAP   12  /* Revoke GFAM host access */
 #define CXL_OP_GFAM_QUERY   13  /* GFAM statistics */
+#define CXL_OP_GET_LSA_INFO 15  /* Query server LSA capacity */
 
 #define CXL_DCD_STATUS_OK              0
 #define CXL_DCD_STATUS_OUT_OF_CAPACITY 1
@@ -1258,6 +1262,13 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 /* LSA address offset - distinguishes LSA from regular memory */
 #define CXL_LSA_ADDR_OFFSET 0xFFFF000000000000ULL
 
+/*
+ * Wire-protocol data buffer size. Cacheline ops use <=64B, but LSA ops use a
+ * full mailbox payload (CXL_MAILBOX_MAX_PAYLOAD_SIZE, 2048); sizing for that
+ * lets one mailbox call complete in a single round trip instead of up to 32.
+ */
+#define CXL_MEMSIM_DATA_SIZE 2048
+
 /* Request structure - matching server's ServerRequest (must be packed for wire protocol) */
 typedef struct __attribute__((packed)) {
     uint8_t op_type;       /* 0=READ, 1=WRITE, 2=GET_SHM_INFO, 3=FAA, 4=CAS, 5=FENCE */
@@ -1266,7 +1277,7 @@ typedef struct __attribute__((packed)) {
     uint64_t timestamp;
     uint64_t value;        /* Value for FAA (add value) or CAS (desired value) */
     uint64_t expected;     /* Expected value for CAS operation */
-    uint8_t data[64];
+    uint8_t data[CXL_MEMSIM_DATA_SIZE];
 } CXLMemSimRequest;
 
 /* Response structure - matching server's ServerResponse (must be packed for wire protocol) */
@@ -1274,8 +1285,22 @@ typedef struct __attribute__((packed)) {
     uint8_t status;
     uint64_t latency_ns;
     uint64_t old_value;    /* Previous value returned by atomic operations */
-    uint8_t data[64];
+    uint8_t data[CXL_MEMSIM_DATA_SIZE];
 } CXLMemSimResponse;
+
+/*
+ * GET_SHM_INFO response - matches the server's SharedMemoryInfoResponse
+ * (src/main_server.cc), NOT a CXLMemSimResponse, so recv it at its own size.
+ * Used once after connect to warn if this device is larger than the server's
+ * backing (top-of-device accesses would be rejected -> guest #UD).
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t status;
+    uint64_t base_addr;
+    uint64_t size;
+    uint64_t num_cachelines;
+    char shm_name[256];
+} CXLMemSimShmInfoResponse;
 
 /* ============================================================================
  * PGAS Shared Memory Protocol (matches cxl_backend.h exactly)
@@ -1394,12 +1419,23 @@ static struct {
     uint64_t stats_writes;
     uint64_t stats_atomics;
     uint64_t stats_fences;
+    uint64_t stats_bulk_zero_ranges;
+    uint64_t stats_bulk_zero_bytes;
+    uint64_t stats_fallback;      /* Ops that fell back to local memory-backend-file */
     bool dcd_enabled;
     bool gfam_enabled;
     uint32_t gfam_host_id;
     uint64_t fabric_refresh_interval_ns;
     uint64_t last_fabric_refresh_ns;
     bool topology_checked;
+    bool bulk_zero_enabled;
+    bool prezero_zero_writes_noop;
+    CXLZeroRange pending_zero;
+    /* This device's CXL memory size (bytes), captured at init to validate
+     * against the server's capacity (GET_SHM_INFO) on connect. */
+    uint64_t device_mem_size;
+    bool shm_info_checked;        /* GET_SHM_INFO capacity check done once */
+    bool lsa_info_checked;        /* GET_LSA_INFO contract check done once */
     /* PGAS shared memory fields */
     char shm_name[256];
     int shm_fd;
@@ -1452,6 +1488,9 @@ static struct {
     .fabric_refresh_interval_ns = 1000000000ULL,
     .last_fabric_refresh_ns = 0,
     .topology_checked = false,
+    .bulk_zero_enabled = false,
+    .prezero_zero_writes_noop = false,
+    .pending_zero = { 0 },
 };
 
 static uint64_t cxl_memsim_parse_wait_us(const char *name,
@@ -1472,6 +1511,20 @@ static uint64_t cxl_memsim_parse_wait_us(const char *name,
     }
 
     return parsed;
+}
+
+/*
+ * Note an access that fell back to the local memory-backend-file instead of
+ * CXLMemSim (not connected, or the RPC failed). Logged on the 1st and every
+ * 100th occurrence so an operator sees it without flooding the serial console.
+ */
+static void cxl_memsim_note_fallback(const char *reason)
+{
+    uint64_t n = ++g_memsim.stats_fallback;
+    if (n == 1 || n % 100 == 0) {
+        info_report("CXL Type3: fallback to local memory (%s), count=%lu",
+                     reason, (unsigned long)n);
+    }
 }
 
 /*
@@ -1536,9 +1589,12 @@ static void cxl_memsim_inject_latency(uint64_t call_start_ns,
 }
 /* Forward declaration - defined after init */
 static int cxl_memsim_connect_locked(void);
+
 static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
                                   void *data, uint64_t value, uint64_t expected,
                                   CXLMemSimResponse *resp);
+static int cxl_memsim_zero_range(uint64_t addr, uint64_t size);
+static int cxl_memsim_flush_pending_zero(void);
 static void cxl_memsim_refresh_fabric_state(CXLType3Dev *ct3d);
 static void cxl_memsim_maybe_refresh_fabric_state(CXLType3Dev *ct3d);
 
@@ -1563,6 +1619,26 @@ static bool cxl_memsim_parse_bool_env(const char *name, bool default_value)
     }
     warn_report("CXL Type3: ignoring invalid boolean %s=%s", name, value);
     return default_value;
+}
+
+static uint64_t cxl_memsim_parse_wait_us(const char *name,
+                                         uint64_t default_us)
+{
+    const char *value = getenv(name);
+    uint64_t parsed;
+
+    if (!value || !value[0]) {
+        return default_us;
+    }
+
+    if (qemu_strtou64(value, NULL, 10, &parsed) < 0 ||
+        parsed > CXL_MEMSIM_MAX_WAIT_US) {
+        warn_report("CXL Type3: invalid %s=%s; using %lu us", name, value,
+                    (unsigned long)default_us);
+        return default_us;
+    }
+
+    return parsed;
 }
 
 static bool cxl_memsim_boot_enabled(CXLType3Dev *ct3d)
@@ -1636,7 +1712,13 @@ static void cxl_memsim_init(CXLType3Dev *ct3d)
     }
     
     info_report("CXL Type3: Initializing CXLMemSim integration");
-    
+
+    /* Capture this device's total CXL memory size so the TCP connect path can
+     * check it against the server's backing capacity (GET_SHM_INFO). */
+    if (ct3d) {
+        g_memsim.device_mem_size = ct3d->cxl_dstate.static_mem_size;
+    }
+
     const char *host = getenv("CXL_MEMSIM_HOST");
     const char *port_str = getenv("CXL_MEMSIM_PORT");
     const char *transport = getenv("CXL_TRANSPORT_MODE");
@@ -1653,6 +1735,12 @@ static void cxl_memsim_init(CXLType3Dev *ct3d)
         "CXL_PGAS_CLIENT_SLEEP_US", CXL_MEMSIM_DEFAULT_SLEEP_US);
     const char *gfam_host_id = getenv("CXL_GFAM_HOST_ID");
     const char *fabric_refresh_ns = getenv("CXL_MEMSIM_FABRIC_REFRESH_NS");
+    uint64_t pgas_client_spin_us = cxl_memsim_parse_wait_us(
+        "CXL_PGAS_CLIENT_SPIN_US", CXL_MEMSIM_DEFAULT_SPIN_US);
+
+    g_memsim.pgas_client_spin_ns = pgas_client_spin_us * 1000;
+    g_memsim.pgas_client_sleep_us = cxl_memsim_parse_wait_us(
+        "CXL_PGAS_CLIENT_SLEEP_US", CXL_MEMSIM_DEFAULT_SLEEP_US);
 
     if (!host || !host[0]) {
         host = CXL_MEMSIM_DEFAULT_HOST;
@@ -1669,6 +1757,10 @@ static void cxl_memsim_init(CXLType3Dev *ct3d)
     g_memsim.gfam_enabled =
         cxl_memsim_parse_bool_env("CXL_GFAM_ENABLE",
                                   ct3d ? ct3d->memsim_gfam : false);
+    g_memsim.bulk_zero_enabled =
+        cxl_memsim_parse_bool_env("CXL_MEMSIM_BULK_ZERO_WRITES", false);
+    g_memsim.prezero_zero_writes_noop =
+        cxl_memsim_parse_bool_env("CXL_MEMSIM_PREZERO_ZERO_WRITES_NOOP", false);
     g_memsim.gfam_host_id = ct3d ? ct3d->memsim_gfam_host_id : 0;
     if (gfam_host_id && gfam_host_id[0]) {
         g_memsim.gfam_host_id = strtoul(gfam_host_id, NULL, 10);
@@ -1757,7 +1849,6 @@ static void cxl_memsim_init(CXLType3Dev *ct3d)
                     (unsigned long)(g_memsim.pgas_client_spin_ns / 1000),
                     (unsigned long)g_memsim.pgas_client_sleep_us);
     }
-
     /* Eagerly establish the connection during init.
      * cxl_type3_read/write gate on (enabled && connected), so if we
      * defer connection to cxl_memsim_request_ext() the gate is never
@@ -1774,6 +1865,23 @@ static void cxl_memsim_init(CXLType3Dev *ct3d)
 
     if (refresh_fabric_state) {
         cxl_memsim_refresh_fabric_state(ct3d);
+    }
+
+    /* Optional explicit provisioning hook. The launcher or setup tooling can
+     * request one validated bulk zero before handing the range to a guest. */
+    const char *zero_range = getenv("CXL_MEMSIM_ZERO_RANGE");
+    if (zero_range && zero_range[0]) {
+        uint64_t addr = 0, size = 0;
+        if (sscanf(zero_range, "%" SCNu64 ":%" SCNu64, &addr, &size) == 2) {
+            if (cxl_memsim_zero_range(addr, size) != 0) {
+                error_report("CXL Type3: bulk zero failed for %s", zero_range);
+            } else {
+                info_report("CXL Type3: bulk zero completed for %s", zero_range);
+            }
+        } else {
+            warn_report("CXL Type3: invalid CXL_MEMSIM_ZERO_RANGE=%s (expected addr:size)",
+                        zero_range);
+        }
     }
 }
 
@@ -1927,7 +2035,7 @@ static int cxl_memsim_connect_locked(void) {
     server_addr.sin_port = htons(g_memsim.port);
     inet_pton(AF_INET, g_memsim.host, &server_addr.sin_addr);
     
-    if (connect(g_memsim.socket_fd, (struct sockaddr *)&server_addr, 
+    if (connect(g_memsim.socket_fd, (struct sockaddr *)&server_addr,
                 sizeof(server_addr)) < 0) {
         close(g_memsim.socket_fd);
         g_memsim.socket_fd = -1;
@@ -1936,11 +2044,106 @@ static int cxl_memsim_connect_locked(void) {
         }
         return -1;
     }
-    
+
+    /*
+     * Bound send()/recv() so a stalled connection fails fast instead of
+     * blocking this thread (and the BQL it holds) forever. TCP_NODELAY avoids
+     * Nagle/delayed-ACK latency on the small per-chunk RPCs.
+     */
+    {
+        int nodelay_opt = 1;
+        setsockopt(g_memsim.socket_fd, IPPROTO_TCP, TCP_NODELAY,
+                   &nodelay_opt, sizeof(nodelay_opt));
+        struct timeval sock_timeout = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(g_memsim.socket_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &sock_timeout, sizeof(sock_timeout));
+        setsockopt(g_memsim.socket_fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &sock_timeout, sizeof(sock_timeout));
+    }
+
     g_memsim.connected = true;
-    info_report("CXL Type3: Successfully connected to CXLMemSim (fd=%d)", 
+    info_report("CXL Type3: Successfully connected to CXLMemSim (fd=%d)",
                 g_memsim.socket_fd);
-    
+
+    /*
+     * One-time capacity check: warn loudly if this device is larger than the
+     * server's backing, since top-of-device accesses would be rejected
+     * (out-of-range DPA) and surface as guest corruption / #UD. GET_SHM_INFO
+     * replies with a CXLMemSimShmInfoResponse (its own size), so recv exactly
+     * that to keep the byte stream aligned.
+     */
+    if (!g_memsim.shm_info_checked) {
+        g_memsim.shm_info_checked = true;
+        CXLMemSimRequest info_req = {0};
+        info_req.op_type = CXL_OP_GET_SHM_INFO;
+        if (send(g_memsim.socket_fd, &info_req, sizeof(info_req), 0) ==
+                (ssize_t)sizeof(info_req)) {
+            CXLMemSimShmInfoResponse info_resp = {0};
+            ssize_t got = recv(g_memsim.socket_fd, &info_resp,
+                               sizeof(info_resp), MSG_WAITALL);
+            if (got == (ssize_t)sizeof(info_resp) && info_resp.status == 0) {
+                info_report("CXL Type3: server backing '%s' size=%lu bytes "
+                            "(%lu cachelines); device memory=%lu bytes",
+                            info_resp.shm_name,
+                            (unsigned long)info_resp.size,
+                            (unsigned long)info_resp.num_cachelines,
+                            (unsigned long)g_memsim.device_mem_size);
+                if (g_memsim.device_mem_size > info_resp.size) {
+                    error_report("CXL Type3: WARNING device CXL memory (%lu bytes) "
+                                 "exceeds cxlmemsim_server capacity (%lu bytes) - "
+                                 "accesses above the server capacity will be "
+                                 "REJECTED and can corrupt the guest. Start the "
+                                 "server with a matching --capacity.",
+                                 (unsigned long)g_memsim.device_mem_size,
+                                 (unsigned long)info_resp.size);
+                }
+            } else {
+                info_report("CXL Type3: GET_SHM_INFO capacity check skipped "
+                            "(got %zd bytes, status=%u)", got,
+                            got >= 1 ? info_resp.status : 0);
+            }
+        }
+    }
+
+    if (!g_memsim.lsa_info_checked) {
+        g_memsim.lsa_info_checked = true;
+        CXLMemSimRequest lsa_req = {0};
+        lsa_req.op_type = CXL_OP_GET_LSA_INFO;
+        if (send(g_memsim.socket_fd, &lsa_req, sizeof(lsa_req), MSG_NOSIGNAL) !=
+                (ssize_t)sizeof(lsa_req)) {
+            error_report("CXL Type3: failed to request server LSA capacity");
+            close(g_memsim.socket_fd);
+            g_memsim.socket_fd = -1;
+            g_memsim.connected = false;
+            return -1;
+        }
+        CXLMemSimResponse lsa_resp = {0};
+        if (recv(g_memsim.socket_fd, &lsa_resp, sizeof(lsa_resp), MSG_WAITALL) !=
+                (ssize_t)sizeof(lsa_resp) || lsa_resp.status != 0) {
+            error_report("CXL Type3: server did not provide a valid LSA capacity");
+            close(g_memsim.socket_fd);
+            g_memsim.socket_fd = -1;
+            g_memsim.connected = false;
+            return -1;
+        }
+        uint64_t server_lsa_size = 0;
+        memcpy(&server_lsa_size, lsa_resp.data, sizeof(server_lsa_size));
+        /* Must match kDefaultLsaSize in src/main_server.cc and size=256K
+         * (CXL_LSA_SIZE) in launch_qemu_cxl*.sh -- the server and this device
+         * map the same shared file and must agree on its size. */
+        const uint64_t required_lsa_size = 256ULL * 1024;
+        info_report("CXL Type3: server LSA size=%" PRIu64 " bytes", server_lsa_size);
+        if (server_lsa_size < required_lsa_size) {
+            error_report("CXL Type3: server LSA (%" PRIu64 " bytes) is smaller than "
+                         "the QEMU 256 KiB LSA; refusing namespace probing",
+                         server_lsa_size);
+            close(g_memsim.socket_fd);
+            g_memsim.socket_fd = -1;
+            g_memsim.connected = false;
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -2112,6 +2315,7 @@ static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
             case CXL_OP_GFAM_MAP:   op_name = "GFAM_MAP"; break;
             case CXL_OP_GFAM_UNMAP: op_name = "GFAM_UNMAP"; break;
             case CXL_OP_GFAM_QUERY: op_name = "GFAM_QUERY"; break;
+            case CXL_OP_ZERO_RANGE: op_name = "ZERO_RANGE"; break;
             default:                op_name = "UNKNOWN"; break;
         }
         info_report("CXL Type3: Request #%d (op=%s, connected=%d, transport=%s)",
@@ -2184,7 +2388,7 @@ static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
     };
 
     if ((op == CXL_OP_WRITE || op == CXL_OP_LSA_WRITE) && data) {
-        memcpy(req.data, data, MIN(size, 64));
+        memcpy(req.data, data, MIN(size, sizeof(req.data)));
     }
 
     if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
@@ -2214,6 +2418,41 @@ static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
     }
 
     pthread_mutex_unlock(&g_memsim.lock);
+    return 0;
+}
+
+static int cxl_memsim_zero_range(uint64_t addr, uint64_t size)
+{
+    CXLMemSimResponse resp = {0};
+
+    if (cxl_memsim_request_ext(CXL_OP_ZERO_RANGE, addr, size,
+                               NULL, 0, 0, &resp) != 0) {
+        return -1;
+    }
+    return resp.status == 0 ? 0 : -1;
+}
+
+static int cxl_memsim_flush_pending_zero(void)
+{
+    CXLZeroRange pending = g_memsim.pending_zero;
+
+    if (pending.length == 0) {
+        return 0;
+    }
+    g_memsim.pending_zero = (CXLZeroRange) { 0 };
+    if (cxl_memsim_zero_range(pending.start, pending.length) != 0) {
+        g_memsim.pending_zero = pending;
+        return -1;
+    }
+    g_memsim.stats_bulk_zero_ranges++;
+    g_memsim.stats_bulk_zero_bytes += pending.length;
+    if (g_memsim.stats_bulk_zero_ranges <= 4 ||
+        (g_memsim.stats_bulk_zero_ranges % 10000) == 0) {
+        info_report("CXL Type3: flushed bulk zero range start=0x%" PRIx64
+                    " length=0x%" PRIx64 " (ranges=%" PRIu64 ")",
+                    pending.start, pending.length,
+                    g_memsim.stats_bulk_zero_ranges);
+    }
     return 0;
 }
 
@@ -2545,6 +2784,11 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     
     /* Initialize CXLMemSim on first use */
     cxl_memsim_init(ct3d);
+
+    /* A read is an ordering boundary for deferred initialization zeroes. */
+    if (cxl_memsim_flush_pending_zero() != 0) {
+        return MEMTX_ERROR;
+    }
     
     /* Log all CXL Type3 reads */
     //info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u", 
@@ -2561,8 +2805,13 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         return MEMTX_OK;
     }
 
+    /* Server is authoritative in TCP/RDMA mode, so we skip local reads. */
+    bool server_authoritative = (
+	g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
+	g_memsim.transport_mode == CXL_TRANSPORT_RDMA
+    );
     /* Forward to CXLMemSim if enabled */
-    if (g_memsim.enabled) {
+    if (g_memsim.enabled && (g_memsim.connected || server_authoritative)) {
         CXLMemSimResponse resp = {0};
 
         /* Record wall-clock time before IPC for latency compensation */
@@ -2582,19 +2831,23 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
                 return MEMTX_ERROR;
             }
 
-            if (size <= 64) {
+            //if (size <= 64) {
                 memcpy(data, resp.data, size);
-            }
+            //}
 
             /* Enforce simulated CXL latency */
             cxl_memsim_inject_latency(start_ns, resp.latency_ns);
             cxl_memsim_maybe_refresh_fabric_state(ct3d);
 
             /* For TCP/RDMA mode, CXLMemSim is authoritative - skip local read */
-            if (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
-                g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
+	    if (server_authoritative) {
                 return MEMTX_OK;
             }
+	} else if (server_authoritative) {
+            //error_report("CXL Type3: CXLMemSim Read failed at dpa=%lx", dpa_offset);
+	    error_report("CXL Type3: CXLMemSim Read RPC failed at dpa=0x%lx",
+			    (unsigned long) dpa_offset);
+	    return MEMTX_ERROR;
         }
     }
 
@@ -2626,8 +2879,46 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
         return MEMTX_OK;
     }
 
+    /* Opt-in: when the launcher has pre-zeroed the range, a guest zero store
+     * is redundant and can be acknowledged locally. Off by default, so
+     * ordinary zero stores still reach the server. */
+    if (g_memsim.prezero_zero_writes_noop && data == 0 && size != 0) {
+        return MEMTX_OK;
+    }
+
+    /* Coalesce contiguous exact-zero writes into one ZERO_RANGE RPC; a
+     * discontiguous write flushes the pending range first, preserving order.
+     * Only TCP/RDMA implement ZERO_RANGE, so SHM/PGAS stays on the normal
+     * write path (nothing gets deferred that can't be flushed). */
+    bool bulk_zero_supported =
+        g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
+        g_memsim.transport_mode == CXL_TRANSPORT_RDMA;
+    if (g_memsim.bulk_zero_enabled && bulk_zero_supported && data == 0 &&
+        size != 0 && size <= sizeof(data)) {
+        if (g_memsim.pending_zero.length != 0 &&
+            (dpa_offset != g_memsim.pending_zero.start +
+             g_memsim.pending_zero.length)) {
+            if (cxl_memsim_flush_pending_zero() != 0) {
+                return MEMTX_ERROR;
+            }
+        }
+        if (cxl_zero_range_add(&g_memsim.pending_zero, dpa_offset, size)) {
+            return MEMTX_OK;
+        }
+        return MEMTX_ERROR;
+    }
+
+    if (cxl_memsim_flush_pending_zero() != 0) {
+        return MEMTX_ERROR;
+    }
+    /* See note in cxl_type3_read(..), server decides on TCP/RDMA */
+    bool server_authoritative = (
+	g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
+	g_memsim.transport_mode == CXL_TRANSPORT_RDMA
+    );
+
     /* Forward to CXLMemSim if enabled */
-    if (g_memsim.enabled) {
+    if (g_memsim.enabled && (g_memsim.connected || server_authoritative)) {
         CXLMemSimResponse resp = {0};
 
         /* Record wall-clock time before IPC for latency compensation */
@@ -2652,10 +2943,14 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
             cxl_memsim_maybe_refresh_fabric_state(ct3d);
 
             /* For TCP/RDMA mode, CXLMemSim is authoritative - skip local write */
-            if (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
-                g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
+	    if (server_authoritative) {
                 return MEMTX_OK;
             }
+	} else if (server_authoritative) {
+            //cxl_memsim_note_fallback("WRITE RPC failed");
+	    error_report("CXL Type3: CXLMemSim Write RPC failed at dpa=0x%lx",
+			    (unsigned long) dpa_offset);
+	    return MEMTX_ERROR;
         }
     }
 
@@ -2756,7 +3051,7 @@ static uint64_t get_lsa(CXLType3Dev *ct3d, void *buf, uint64_t size,
         uint8_t *dst = (uint8_t *)buf;
 
         while (remaining > 0) {
-            uint64_t chunk = MIN(remaining, 64);
+            uint64_t chunk = MIN(remaining, CXL_MEMSIM_DATA_SIZE);
             CXLMemSimResponse resp = {0};
 
             if (cxl_memsim_request_ext(CXL_OP_LSA_READ, cur_offset, chunk,
@@ -2764,6 +3059,7 @@ static uint64_t get_lsa(CXLType3Dev *ct3d, void *buf, uint64_t size,
                 resp.status != 0) {
                 error_report("CXL Type3: LSA read failed at offset 0x%lx",
                              (unsigned long)cur_offset);
+                cxl_memsim_note_fallback("LSA read RPC failed");
                 goto fallback_read;
             }
             memcpy(dst, resp.data, chunk);
@@ -2805,9 +3101,9 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
         const uint8_t *src = (const uint8_t *)buf;
 
         while (remaining > 0) {
-            uint64_t chunk = MIN(remaining, 64);
+            uint64_t chunk = MIN(remaining, CXL_MEMSIM_DATA_SIZE);
             CXLMemSimResponse resp = {0};
-            uint8_t chunk_data[64];
+            uint8_t chunk_data[CXL_MEMSIM_DATA_SIZE];
 
             memcpy(chunk_data, src, chunk);
             if (cxl_memsim_request_ext(CXL_OP_LSA_WRITE, cur_offset, chunk,
@@ -2815,6 +3111,7 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
                 resp.status != 0) {
                 error_report("CXL Type3: LSA write failed at offset 0x%lx",
                              (unsigned long)cur_offset);
+                cxl_memsim_note_fallback("LSA write RPC failed");
                 goto fallback_write;
             }
             src += chunk;

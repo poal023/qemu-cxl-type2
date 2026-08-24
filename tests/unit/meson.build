@@ -182,7 +182,8 @@ if have_system
     'test-xbzrle': [migration],
     'test-util-sockets': ['socket-helpers.c'],
     'test-base64': [],
-    'test-bufferiszero': [],
+  'test-bufferiszero': [],
+  'test-cxl-zero-coalesce': [meson.project_source_root() / 'util/cxl-zero-coalesce.c'],
     'test-smp-parse': [qom, meson.project_source_root() / 'hw/core/machine-smp.c'],
     'test-vmstate': [migration, io],
     'test-yank': ['socket-helpers.c', qom, io, chardev]
